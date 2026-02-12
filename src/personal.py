@@ -1,46 +1,112 @@
+"""
+=====================================================
+MÓDULO: Registro de Producción con Sistema de Tiempos
+=====================================================
+Versión: 3.1 - Con debugging mejorado
+=====================================================
+"""
+
 import streamlit as st
 import pandas as pd
+from datetime import datetime
 from src.database import get_connection
 
 
 def mostrar_pantalla():
+    """
+    Pantalla principal de registro de producción
+    """
     st.title("🛠️ Registro de Producción")
 
-    
-    # 1PASO 1 – INGRESAR LOTE
-    #
-    st.subheader("1 Ingrese Lote")
+    # ========================================
+    # PASO 1: INGRESAR LOTE
+    # ========================================
+    st.subheader("📦 1. Ingrese Lote")
 
     lote_padre = st.text_input(
         "LOTE (Padre):",
-        key="input_lote"
+        key="input_lote",
+        placeholder="Ej: 4019635"
     ).strip()
 
     if not lote_padre:
-        st.info("Ingrese primero el número de lote para continuar.")
+        st.info("👉 Ingrese primero el número de lote para continuar.")
         return
 
+    # Conectar a base de datos
     conn = get_connection()
     if not conn:
-        st.error("No hay conexión a la base de datos.")
+        st.error("❌ No hay conexión a la base de datos.")
         return
 
     cursor = conn.cursor(dictionary=True)
 
-    # 
-    #  ESTADO DE PRODUCCIÓN
-    # 
-    cursor.execute("SELECT DISTINCT nombre_maquina FROM ordenes")
-    lista_maquinas = ["Seleccione Máquina..."] + \
-        [row['nombre_maquina'] for row in cursor.fetchall()]
+    # ========================================
+    # VERIFICAR SESIÓN ACTIVA DEL OPERARIO
+    # ========================================
+    id_operario = st.session_state.usuario["id"]
+    
+    cursor.execute("""
+        SELECT id_registro, lote_referencia, planchas_procesadas, hora_inicio
+        FROM produccion 
+        WHERE id_personal = %s 
+          AND estado = 'procesando'
+        LIMIT 1
+    """, (id_operario,))
+    
+    sesion_activa = cursor.fetchone()
 
+    # Si hay sesión activa, verificar si es de OTRO lote
+    if sesion_activa:
+        cursor.execute("""
+            SELECT lote_padre 
+            FROM ordenes 
+            WHERE lote_completo = %s
+        """, (sesion_activa['lote_referencia'],))
+        
+        lote_activo = cursor.fetchone()
+        
+        if lote_activo and lote_activo['lote_padre'] != lote_padre:
+            otro_lote = lote_activo['lote_padre']
+            st.error(
+                f"⚠️ Ya tienes una producción activa en el lote **{otro_lote}**. "
+                f"Debes finalizarla antes de iniciar otra."
+            )
+            conn.close()
+            return
+
+    # ========================================
+    # OBTENER MÁQUINAS DISPONIBLES
+    # ========================================
+    cursor.execute("""
+        SELECT DISTINCT nombre_maquina 
+        FROM ordenes 
+        WHERE nombre_maquina IS NOT NULL
+        ORDER BY nombre_maquina
+    """)
+    
+    lista_maquinas = ["Seleccione Máquina..."] + \
+        [row['nombre_maquina'] for row in cursor.fetchall() if row['nombre_maquina']]
+
+    # ========================================
+    # CALCULAR ESTADO DE PRODUCCIÓN
+    # ========================================
     query_saldo = """
         SELECT 
             MAX(o.cantidad_planchas) as meta,
-            (SELECT IFNULL(SUM(planchas_procesadas), 0) FROM produccion 
+            
+            (SELECT IFNULL(SUM(planchas_procesadas), 0) 
+             FROM produccion 
              WHERE lote_referencia IN 
-             (SELECT lote_completo FROM ordenes WHERE lote_padre = %s)) 
-             / (SELECT COUNT(*) FROM ordenes WHERE lote_padre = %s) as hecho
+                   (SELECT lote_completo FROM ordenes WHERE lote_padre = %s)
+               AND estado = 'finalizado') as finalizado,
+            
+            (SELECT IFNULL(SUM(planchas_procesadas), 0) 
+             FROM produccion 
+             WHERE lote_referencia IN 
+                   (SELECT lote_completo FROM ordenes WHERE lote_padre = %s)
+               AND estado = 'procesando') as en_proceso
+               
         FROM ordenes o 
         WHERE o.lote_padre = %s
     """
@@ -48,169 +114,510 @@ def mostrar_pantalla():
     resumen = cursor.fetchone()
 
     if not resumen or not resumen["meta"]:
-        st.warning("No se encontraron órdenes para este lote.")
+        st.warning("⚠️ No se encontraron órdenes para este lote.")
         conn.close()
         return
 
     meta = int(resumen["meta"])
-    hecho = int(resumen["hecho"] or 0)
-    faltante = meta - hecho
+    finalizado = int(resumen["finalizado"] or 0)
+    en_proceso = int(resumen["en_proceso"] or 0)
+    total_ocupado = finalizado + en_proceso
+    faltante = meta - total_ocupado
 
+    # ========================================
+    # PANEL DE ESTADO EN TIEMPO REAL
+    # ========================================
     st.markdown("### 📊 Estado de Producción")
 
-    if faltante > 0:
-        progreso = hecho / meta
-        st.progress(progreso)
-        st.info(
-            f"Procesadas **{hecho}** de **{meta}** planchas. "
-            f"Pendientes: **{faltante}**"
+    col_estado1, col_estado2, col_estado3 = st.columns(3)
+    
+    with col_estado1:
+        st.metric(
+            label="✅ Finalizadas",
+            value=f"{finalizado} / {meta}",
+            delta=f"{(finalizado/meta*100):.1f}%" if meta > 0 else "0%"
         )
-    else:
+    
+    with col_estado2:
+        st.metric(
+            label="⏳ En Proceso",
+            value=en_proceso,
+            delta="Activo" if en_proceso > 0 else None
+        )
+    
+    with col_estado3:
+        st.metric(
+            label="📦 Pendientes",
+            value=faltante,
+            delta=f"{(faltante/meta*100):.1f}%" if meta > 0 else "0%"
+        )
+
+    if meta > 0:
+        progreso = finalizado / meta
+        st.progress(progreso)
+
+    # Mostrar quién está trabajando
+    if en_proceso > 0:
+        cursor.execute("""
+            SELECT 
+                p.planchas_procesadas,
+                p.hora_inicio,
+                TIMESTAMPDIFF(MINUTE, p.hora_inicio, NOW()) as minutos,
+                u.nombre_usuario as operario
+            FROM produccion p
+            INNER JOIN usuarios u ON p.id_personal = u.id
+            WHERE p.lote_referencia IN 
+                  (SELECT lote_completo FROM ordenes WHERE lote_padre = %s)
+              AND p.estado = 'procesando'
+        """, (lote_padre,))
+        
+        trabajadores = cursor.fetchall()
+        
+        if trabajadores:
+            st.info("👷 **Personal trabajando ahora:**")
+            for t in trabajadores:
+                st.write(
+                    f"• **{t['operario']}** - {t['planchas_procesadas']} planchas "
+                    f"(Iniciado hace {t['minutos']} min)"
+                )
+
+    # Bloquear si ya está completo
+    if faltante <= 0 and en_proceso == 0:
         st.success(
-            f"✅ Producción completada: {meta} de {meta} planchas procesadas."
+            f"✅ Producción completada: **{meta}** de **{meta}** planchas procesadas."
         )
         conn.close()
-        return  # 🔒 Bloquea todo si ya terminó
+        return
 
-    #  FORMULARIO
+    # ========================================
+    # FORMULARIO DE PRODUCCIÓN
+    # ========================================
+    st.subheader("⚙️ 2. Registrar Producción")
 
-    st.subheader(" Registrar Producción")
+    # Verificar si ESTE operario tiene sesión activa en ESTE lote
+    cursor.execute("""
+        SELECT id_registro, planchas_procesadas, maquina_real, hora_inicio
+        FROM produccion 
+        WHERE id_personal = %s 
+          AND lote_referencia IN 
+              (SELECT lote_completo FROM ordenes WHERE lote_padre = %s)
+          AND estado = 'procesando'
+        LIMIT 1
+    """, (id_operario, lote_padre))
+    
+    mi_sesion = cursor.fetchone()
 
     with st.container(border=True):
-
+        
         col1, col2 = st.columns(2)
 
         with col1:
-            maquina_real = st.selectbox(
-                "Maq. Proceso (Real):",
-                lista_maquinas,
-                key="maquina_real"
-            )
+            # MÁQUINA (bloqueada si ya inició)
+            if mi_sesion:
+                st.text_input(
+                    "Máquina de Proceso:",
+                    value=mi_sesion['maquina_real'] or "N/A",
+                    disabled=True,
+                    key="maquina_bloqueada"
+                )
+                maquina_real = mi_sesion['maquina_real']
+            else:
+                maquina_real = st.selectbox(
+                    "Máquina de Proceso:",
+                    lista_maquinas,
+                    key="maquina_real"
+                )
 
-            planchas_proc = st.number_input(
-                "Planchas Procesadas:",
-                min_value=1,
-                max_value=faltante,  # 🔒 no puede exceder lo pendiente
-                step=1,
-                key="planchas_proc"
-            )
+            # PLANCHAS (bloqueadas si ya inició)
+            if mi_sesion:
+                st.number_input(
+                    "Planchas a Procesar:",
+                    value=int(mi_sesion['planchas_procesadas']),
+                    disabled=True,
+                    key="planchas_bloqueadas"
+                )
+                planchas_proc = int(mi_sesion['planchas_procesadas'])
+            else:
+                planchas_proc = st.number_input(
+                    "Planchas a Procesar:",
+                    min_value=1,
+                    max_value=max(faltante, 1),
+                    step=1,
+                    value=min(10, max(faltante, 1)),
+                    key="planchas_proc"
+                )
 
         with col2:
+            # Campos solo habilitados al finalizar
             lote_fisico = st.text_input(
                 "Lote de Planchas:",
-                key="lote_fisico"
+                disabled=not mi_sesion,
+                key="lote_fisico",
+                help="Se habilita al finalizar" if not mi_sesion else None,
+                placeholder="Ej: LP-001"
             )
 
             ancho_real = st.number_input(
-                "Ancho Real Plancha:",
+                "Ancho Real Plancha (mm):",
                 min_value=0,
-                key="ancho_real"
+                disabled=not mi_sesion,
+                key="ancho_real",
+                help="Se habilita al finalizar" if not mi_sesion else None
             )
 
             observaciones = st.selectbox(
-                "Observación (Opcional):",
+                "Observación:",
                 [
-                    "",  # 🔹 permite vacío
+                    "",
                     "Descuadre", "Ondulado", "Quebrado",
                     "Oxidado", "Rayado", "Rebaba",
                     "Bajo espesor", "Daño de maquina"
                 ],
-                key="observaciones"
+                disabled=not mi_sesion,
+                key="observaciones",
+                help="Se habilita al finalizar" if not mi_sesion else None
             )
 
- 
-    4#TABLA DETALLE
-    
+        # CRONÓMETRO
+        if mi_sesion:
+            tiempo_transcurrido = datetime.now() - mi_sesion['hora_inicio']
+            minutos_totales = int(tiempo_transcurrido.total_seconds() / 60)
+            horas = minutos_totales // 60
+            mins = minutos_totales % 60
+            
+            if horas > 0:
+                tiempo_str = f"{horas}h {mins}min"
+            else:
+                tiempo_str = f"{mins} minutos"
+                
+            st.info(
+                f"⏱️ **Tiempo transcurrido:** {tiempo_str} "
+                f"(Inicio: {mi_sesion['hora_inicio'].strftime('%H:%M:%S')})"
+            )
+
+    # ========================================
+    # TABLA DETALLE - EDITABLE SI YA INICIÓ
+    # ========================================
     cursor.execute("SELECT * FROM ordenes WHERE lote_padre = %s", (lote_padre,))
     filas = cursor.fetchall()
 
     if filas:
         df = pd.DataFrame(filas)
 
-        df["Cant. Cortada Calc"] = planchas_proc * df["cant"]
-        df["Peso Total Calc"] = df["peso_unitario"] * df["Cant. Cortada Calc"]
-
         st.markdown("### 📋 Detalle del Corte")
 
-        columnas_ver = {
-            "cantidad_planchas": "Cant. Plancha",
-            "desaplancha": "Aprovechamiento",
-            "desarrollo": "Ancho",
-            "largo": "Largo",
-            "Cant. Cortada Calc": "Cant. Cortada",
-            "destino": "Destino",
-            "peso_unitario": "Peso Unitario",
-            "Peso Total Calc": "Peso Total",
-            "cod_IBS": "Código",
-            "orden": "Orden",
-            "lote_completo": "Lote"
-        }
+        if mi_sesion:
+            # ========================================
+            # MODO EDICIÓN (Ya inició producción)
+            # ========================================
+            st.info("✏️ **Modo edición activado** - Puede modificar los campos resaltados")
+            
+            # Capturar datos editados
+            datos_editados = []
+            
+            for idx, row in enumerate(df.to_dict('records')):
+                st.markdown(f"**Orden {idx + 1}: {row['lote_completo']}**")
+                
+                col_ed1, col_ed2, col_ed3 = st.columns(3)
+                
+                with col_ed1:
+                    cant_cortada = st.number_input(
+                        "Cant. Cortada:",
+                        min_value=0,
+                        value=int(row['cant'] * planchas_proc),
+                        key=f"cant_cortada_{idx}",
+                        help="Cantidad real cortada"
+                    )
+                
+                with col_ed2:
+                    ancho_fleje = st.number_input(
+                        "Ancho Fleje (mm):",
+                        min_value=0,
+                        value=int(row['desarrollo'] or 0),
+                        key=f"ancho_fleje_{idx}",
+                        help="Ancho real del fleje"
+                    )
+                
+                with col_ed3:
+                    destino_edit = st.selectbox(
+                        "Destino:",
+                        ["PLEGADO", "VENTA"],
+                        index=0 if row['destino'] == 'PLEGADO' else 1,
+                        key=f"destino_{idx}"
+                    )
+                
+                # Guardar datos editados
+                datos_editados.append({
+                    'lote_completo': row['lote_completo'],
+                    'cant_cortada_real': cant_cortada,
+                    'ancho_fleje_real': ancho_fleje,
+                    'destino_real': destino_edit
+                })
+                
+                st.divider()
+            
+        else:
+            # ========================================
+            # MODO LECTURA (No ha iniciado)
+            # ========================================
+            datos_editados = None
+            
+            df["Cant. Cortada Calc"] = planchas_proc * df["cant"]
+            df["Peso Total Calc"] = df["peso_unitario"] * df["Cant. Cortada Calc"]
 
-        st.table(
-            df[list(columnas_ver.keys())]
-            .rename(columns=columnas_ver)
-        )
+            columnas_ver = {
+                "cantidad_planchas": "Cant. Plancha",
+                "desaplancha": "Aprovechamiento",
+                "desarrollo": "Ancho",
+                "largo": "Largo",
+                "Cant. Cortada Calc": "Cant. Cortada",
+                "destino": "Destino",
+                "peso_unitario": "Peso Unitario",
+                "Peso Total Calc": "Peso Total",
+                "cod_IBS": "Código",
+                "orden": "Orden",
+                "lote_completo": "Lote"
+            }
 
-        
-        # BOTÓN GUARDAR
-        
-        boton_deshabilitado = (
-            maquina_real == "Seleccione Máquina..."
-        )
-
-        if st.button(
-            "GUARDAR REGISTRO",
-            use_container_width=True,
-            disabled=boton_deshabilitado
-        ):
-            guardar_y_limpiar_interfaz(
-                filas,
-                planchas_proc,
-                lote_fisico,
-                ancho_real,
-                observaciones,
-                maquina_real
+            st.table(
+                df[list(columnas_ver.keys())]
+                .rename(columns=columnas_ver)
             )
+
+        # ========================================
+        # BOTÓN DINÁMICO
+        # ========================================
+        if mi_sesion:
+            # FINALIZAR
+            if st.button(
+                "✅ FINALIZAR Y GUARDAR",
+                use_container_width=True,
+                key="btn_finalizar"
+            ):
+                st.write("🔍 DEBUG: Botón clickeado")
+                st.write(f"🔍 ID Registro: {mi_sesion['id_registro']}")
+                st.write(f"🔍 Datos editados: {len(datos_editados)} órdenes")
+                
+                # Protección anti-doble-clic
+                if 'procesando_finalizacion' not in st.session_state:
+                    st.write("🔍 DEBUG: Ejecutando finalizar_produccion...")
+                    st.session_state.procesando_finalizacion = True
+                    
+                    finalizar_produccion(
+                        mi_sesion['id_registro'],
+                        lote_fisico,
+                        ancho_real,
+                        observaciones,
+                        datos_editados
+                    )
+                else:
+                    st.warning("⚠️ Ya se está procesando la finalización...")
+        else:
+            # INICIAR
+            boton_deshabilitado = (
+                maquina_real == "Seleccione Máquina..." or
+                planchas_proc <= 0 or
+                faltante <= 0
+            )
+
+            if st.button(
+                "🚀 INICIAR PRODUCCIÓN",
+                use_container_width=True,
+                disabled=boton_deshabilitado,
+                key="btn_iniciar"
+            ):
+                # Protección anti-doble-clic
+                if 'procesando_inicio' not in st.session_state:
+                    st.session_state.procesando_inicio = True
+                    
+                    iniciar_produccion(
+                        filas,
+                        planchas_proc,
+                        maquina_real
+                    )
 
     conn.close()
 
 
-def guardar_y_limpiar_interfaz(
-    filas, planchas, lote_f, ancho_r, obs, maq_r
-):
+# ============================================================
+# FUNCIÓN: INICIAR PRODUCCIÓN
+# ============================================================
+def iniciar_produccion(filas, planchas, maq_r):
+    """
+    Inserta registros con estado='procesando'
+    """
     conn = get_connection()
     if not conn:
-        st.error("Error de conexión.")
+        st.error("❌ Error de conexión a la base de datos.")
+        if 'procesando_inicio' in st.session_state:
+            del st.session_state.procesando_inicio
         return
 
     try:
         cursor = conn.cursor()
         id_op = st.session_state.usuario["id"]
+        hora_actual = datetime.now()
 
+        # Verificar que no exista sesión activa
+        cursor.execute("""
+            SELECT COUNT(*) as total
+            FROM produccion 
+            WHERE id_personal = %s 
+              AND estado = 'procesando'
+        """, (id_op,))
+        
+        existe = cursor.fetchone()
+        
+        if existe and existe['total'] > 0:
+            st.warning("⚠️ Ya tienes una sesión activa. Recargando...")
+            if 'procesando_inicio' in st.session_state:
+                del st.session_state.procesando_inicio
+            st.rerun()
+            return
+
+        # Insertar registros
         for row in filas:
             query = """
                 INSERT INTO produccion
-                (lote_referencia, id_personal, lote_de_planchas,
-                 planchas_procesadas, observacciones,
-                 ancho_real, maquina_real)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (lote_referencia, id_personal, planchas_procesadas,
+                 maquina_real, hora_inicio, estado)
+                VALUES (%s, %s, %s, %s, %s, 'procesando')
             """
             cursor.execute(
                 query,
                 (
                     row["lote_completo"],
                     id_op,
-                    lote_f,
                     planchas,
-                    obs if obs != "" else None,  # guarda NULL si está vacío
-                    ancho_r,
-                    maq_r
+                    maq_r,
+                    hora_actual
                 )
             )
 
         conn.commit()
+        
+        if 'procesando_inicio' in st.session_state:
+            del st.session_state.procesando_inicio
+        
+        st.success("🚀 Producción iniciada. Ahora puede editar los datos del corte.")
+        st.rerun()
 
-        #  Limpieza SOLO del formulario
+    except Exception as e:
+        st.error(f"❌ Error al iniciar producción: {e}")
+        conn.rollback()
+        
+        if 'procesando_inicio' in st.session_state:
+            del st.session_state.procesando_inicio
+            
+    finally:
+        conn.close()
+
+
+# ============================================================
+# FUNCIÓN: FINALIZAR PRODUCCIÓN
+# ============================================================
+def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
+    """
+    Actualiza produccion y guarda detalles editados
+    """
+    st.write("🔍 DEBUG: Función finalizar_produccion EJECUTADA")
+    st.write(f"🔍 Parámetros recibidos:")
+    st.write(f"  - ID Registro: {id_registro}")
+    st.write(f"  - Lote físico: {lote_f}")
+    st.write(f"  - Ancho real: {ancho_r}")
+    st.write(f"  - Observaciones: {obs}")
+    st.write(f"  - Datos editados: {datos_editados}")
+    
+    conn = get_connection()
+    if not conn:
+        st.error("❌ Error de conexión a la base de datos.")
+        if 'procesando_finalizacion' in st.session_state:
+            del st.session_state.procesando_finalizacion
+        return
+
+    try:
+        cursor = conn.cursor()
+        hora_actual = datetime.now()
+        
+        st.write(f"🔍 DEBUG: Hora actual: {hora_actual}")
+
+        # Verificar que el registro esté en procesando
+        cursor.execute("""
+            SELECT estado 
+            FROM produccion 
+            WHERE id_registro = %s
+        """, (id_registro,))
+        
+        registro = cursor.fetchone()
+        st.write(f"🔍 DEBUG: Registro encontrado: {registro}")
+        
+        if not registro:
+            st.error(f"❌ No se encontró el registro {id_registro}")
+            if 'procesando_finalizacion' in st.session_state:
+                del st.session_state.procesando_finalizacion
+            return
+            
+        if registro['estado'] == 'finalizado':
+            st.warning("⚠️ Esta producción ya fue finalizada. Recargando...")
+            if 'procesando_finalizacion' in st.session_state:
+                del st.session_state.procesando_finalizacion
+            st.rerun()
+            return
+
+        # 1. Actualizar tabla produccion
+        st.write("🔍 DEBUG: Actualizando tabla produccion...")
+        query_produccion = """
+            UPDATE produccion
+            SET hora_fin = %s,
+                estado = 'finalizado',
+                lote_de_planchas = %s,
+                ancho_real = %s,
+                observacciones = %s
+            WHERE id_registro = %s
+        """
+        cursor.execute(
+            query_produccion,
+            (
+                hora_actual,
+                lote_f if lote_f else None,
+                ancho_r if ancho_r > 0 else None,
+                obs if obs != "" else None,
+                id_registro
+            )
+        )
+        st.write(f"🔍 DEBUG: Filas afectadas en produccion: {cursor.rowcount}")
+
+        # 2. Guardar detalles editados
+        if datos_editados:
+            st.write(f"🔍 DEBUG: Guardando {len(datos_editados)} detalles...")
+            for idx, dato in enumerate(datos_editados):
+                st.write(f"🔍 DEBUG: Detalle {idx + 1}: {dato}")
+                query_detalle = """
+                    INSERT INTO detalles_produccion 
+                    (id_registro_produccion, lote_completo, cant_cortada_real, 
+                     ancho_fleje_real, destino_real)
+                    VALUES (%s, %s, %s, %s, %s)
+                """
+                cursor.execute(
+                    query_detalle,
+                    (
+                        id_registro,
+                        dato['lote_completo'],
+                        dato['cant_cortada_real'],
+                        dato['ancho_fleje_real'],
+                        dato['destino_real']
+                    )
+                )
+                st.write(f"🔍 DEBUG: Detalle {idx + 1} insertado OK")
+        
+        st.write("🔍 DEBUG: Haciendo COMMIT...")
+        conn.commit()
+        st.write("🔍 DEBUG: COMMIT exitoso")
+
+        # Limpiar session_state
+        if 'procesando_finalizacion' in st.session_state:
+            del st.session_state.procesando_finalizacion
+            
         for key in [
             "input_lote",
             "maquina_real",
@@ -222,10 +629,24 @@ def guardar_y_limpiar_interfaz(
             if key in st.session_state:
                 del st.session_state[key]
 
-        st.success(" Registro guardado correctamente.")
+        st.success("✅ Producción finalizada y guardada correctamente.")
+        st.write("🔍 DEBUG: Recargando página...")
         st.rerun()
 
     except Exception as e:
-        st.error(f"Error al guardar: {e}")
+        st.error(f"❌ Error al finalizar producción: {str(e)}")
+        st.write(f"🔍 DEBUG: Tipo de error: {type(e).__name__}")
+        import traceback
+        st.code(traceback.format_exc())
+        conn.rollback()
+        
+        if 'procesando_finalizacion' in st.session_state:
+            del st.session_state.procesando_finalizacion
+            
     finally:
         conn.close()
+
+
+# ============================================================
+# FIN DEL MÓDULO
+# ============================================================
