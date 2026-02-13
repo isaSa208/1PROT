@@ -2,7 +2,7 @@
 =====================================================
 MÓDULO: Registro de Producción con Sistema de Tiempos
 =====================================================
-Versión: 3.1 - Con debugging mejorado
+Versión: 3.3 - Corregido duplicación al iniciar
 =====================================================
 """
 
@@ -356,13 +356,49 @@ def mostrar_pantalla():
                 
                 st.divider()
             
+            # Mostrar tabla resumen
+            df["Cant Cortada"] = [d['cant_cortada_real'] for d in datos_editados]
+            df["Ancho Fleje"] = [d['ancho_fleje_real'] for d in datos_editados]
+            df["Flejes Pend."] = df["desaplancha"] - df["Cant Cortada"]
+            df["Destino"] = [d['destino_real'] for d in datos_editados]
+            df["Peso Total"] = df["peso_unitario"] * df["Cant Cortada"]
+
+            columnas_resumen = {
+                "lote_completo": "Lote",
+                "cantidad_planchas": "Cant Plancha",
+                "desaplancha": "Aprov.",
+                "Ancho Fleje": "Ancho Fleje",
+                "largo": "Largo",
+                "Cant Cortada": "Cant Cortada",
+                "Flejes Pend.": "Flejes Pend.",
+                "Destino": "Destino",
+                "peso_unitario": "Peso Unit.",
+                "Peso Total": "Peso Total",
+                "cod_IBS": "Cód. IBS"
+            }
+
+            df_mostrar = df[list(columnas_resumen.keys())].copy()
+            
+            # Sin decimales excepto pesos
+            for col in ["cantidad_planchas", "desaplancha", "Ancho Fleje", "largo", 
+                       "Cant Cortada", "Flejes Pend."]:
+                if col in df_mostrar.columns:
+                    df_mostrar[col] = df_mostrar[col].fillna(0).astype(int)
+            
+            if "peso_unitario" in df_mostrar.columns:
+                df_mostrar["peso_unitario"] = df_mostrar["peso_unitario"].map('{:.4f}'.format)
+            if "Peso Total" in df_mostrar.columns:
+                df_mostrar["Peso Total"] = df_mostrar["Peso Total"].map('{:.4f}'.format)
+
+            st.table(df_mostrar.rename(columns=columnas_resumen))
+            
         else:
             # ========================================
             # MODO LECTURA (No ha iniciado)
             # ========================================
             datos_editados = None
             
-            df["Cant. Cortada Calc"] = planchas_proc * df["cant"]
+            df["Cant. Cortada Calc"] = (planchas_proc * df["cant"]).astype(int)
             df["Peso Total Calc"] = df["peso_unitario"] * df["Cant. Cortada Calc"]
 
             columnas_ver = {
@@ -379,10 +415,19 @@ def mostrar_pantalla():
                 "lote_completo": "Lote"
             }
 
-            st.table(
-                df[list(columnas_ver.keys())]
-                .rename(columns=columnas_ver)
-            )
+            df_mostrar = df[list(columnas_ver.keys())].copy()
+            
+            for col in ["cantidad_planchas", "desaplancha", "desarrollo", "largo", 
+                       "Cant. Cortada Calc", "orden"]:
+                if col in df_mostrar.columns:
+                    df_mostrar[col] = df_mostrar[col].fillna(0).astype(int)
+            
+            if "peso_unitario" in df_mostrar.columns:
+                df_mostrar["peso_unitario"] = df_mostrar["peso_unitario"].map('{:.4f}'.format)
+            if "Peso Total Calc" in df_mostrar.columns:
+                df_mostrar["Peso Total Calc"] = df_mostrar["Peso Total Calc"].map('{:.4f}'.format)
+
+            st.table(df_mostrar.rename(columns=columnas_ver))
 
         # ========================================
         # BOTÓN DINÁMICO
@@ -394,13 +439,7 @@ def mostrar_pantalla():
                 use_container_width=True,
                 key="btn_finalizar"
             ):
-                st.write("🔍 DEBUG: Botón clickeado")
-                st.write(f"🔍 ID Registro: {mi_sesion['id_registro']}")
-                st.write(f"🔍 Datos editados: {len(datos_editados)} órdenes")
-                
-                # Protección anti-doble-clic
                 if 'procesando_finalizacion' not in st.session_state:
-                    st.write("🔍 DEBUG: Ejecutando finalizar_produccion...")
                     st.session_state.procesando_finalizacion = True
                     
                     finalizar_produccion(
@@ -410,8 +449,6 @@ def mostrar_pantalla():
                         observaciones,
                         datos_editados
                     )
-                else:
-                    st.warning("⚠️ Ya se está procesando la finalización...")
         else:
             # INICIAR
             boton_deshabilitado = (
@@ -426,12 +463,11 @@ def mostrar_pantalla():
                 disabled=boton_deshabilitado,
                 key="btn_iniciar"
             ):
-                # Protección anti-doble-clic
                 if 'procesando_inicio' not in st.session_state:
                     st.session_state.procesando_inicio = True
                     
                     iniciar_produccion(
-                        filas,
+                        lote_padre,  # ← Cambiado: solo pasamos el lote_padre
                         planchas_proc,
                         maquina_real
                     )
@@ -440,11 +476,11 @@ def mostrar_pantalla():
 
 
 # ============================================================
-# FUNCIÓN: INICIAR PRODUCCIÓN
+# FUNCIÓN: INICIAR PRODUCCIÓN (CORREGIDA)
 # ============================================================
-def iniciar_produccion(filas, planchas, maq_r):
+def iniciar_produccion(lote_padre, planchas, maq_r):
     """
-    Inserta registros con estado='procesando'
+    Inserta UN SOLO registro con estado='procesando'
     """
     conn = get_connection()
     if not conn:
@@ -454,7 +490,7 @@ def iniciar_produccion(filas, planchas, maq_r):
         return
 
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         id_op = st.session_state.usuario["id"]
         hora_actual = datetime.now()
 
@@ -475,24 +511,39 @@ def iniciar_produccion(filas, planchas, maq_r):
             st.rerun()
             return
 
-        # Insertar registros
-        for row in filas:
-            query = """
-                INSERT INTO produccion
-                (lote_referencia, id_personal, planchas_procesadas,
-                 maquina_real, hora_inicio, estado)
-                VALUES (%s, %s, %s, %s, %s, 'procesando')
-            """
-            cursor.execute(
-                query,
-                (
-                    row["lote_completo"],
-                    id_op,
-                    planchas,
-                    maq_r,
-                    hora_actual
-                )
+        # Obtener el PRIMER lote_completo del lote_padre
+        cursor.execute("""
+            SELECT lote_completo 
+            FROM ordenes 
+            WHERE lote_padre = %s 
+            LIMIT 1
+        """, (lote_padre,))
+        
+        primera_orden = cursor.fetchone()
+        
+        if not primera_orden:
+            st.error("❌ No se encontraron órdenes para este lote.")
+            if 'procesando_inicio' in st.session_state:
+                del st.session_state.procesando_inicio
+            return
+
+        # Insertar UN SOLO registro
+        query = """
+            INSERT INTO produccion
+            (lote_referencia, id_personal, planchas_procesadas,
+             maquina_real, hora_inicio, estado)
+            VALUES (%s, %s, %s, %s, %s, 'procesando')
+        """
+        cursor.execute(
+            query,
+            (
+                primera_orden['lote_completo'],
+                id_op,
+                planchas,
+                maq_r,
+                hora_actual
             )
+        )
 
         conn.commit()
         
@@ -520,14 +571,6 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
     """
     Actualiza produccion y guarda detalles editados
     """
-    st.write("🔍 DEBUG: Función finalizar_produccion EJECUTADA")
-    st.write(f"🔍 Parámetros recibidos:")
-    st.write(f"  - ID Registro: {id_registro}")
-    st.write(f"  - Lote físico: {lote_f}")
-    st.write(f"  - Ancho real: {ancho_r}")
-    st.write(f"  - Observaciones: {obs}")
-    st.write(f"  - Datos editados: {datos_editados}")
-    
     conn = get_connection()
     if not conn:
         st.error("❌ Error de conexión a la base de datos.")
@@ -536,10 +579,8 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
         return
 
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         hora_actual = datetime.now()
-        
-        st.write(f"🔍 DEBUG: Hora actual: {hora_actual}")
 
         # Verificar que el registro esté en procesando
         cursor.execute("""
@@ -549,7 +590,6 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
         """, (id_registro,))
         
         registro = cursor.fetchone()
-        st.write(f"🔍 DEBUG: Registro encontrado: {registro}")
         
         if not registro:
             st.error(f"❌ No se encontró el registro {id_registro}")
@@ -558,14 +598,13 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
             return
             
         if registro['estado'] == 'finalizado':
-            st.warning("⚠️ Esta producción ya fue finalizada. Recargando...")
+            st.warning("⚠️ Esta producción ya fue finalizada.")
             if 'procesando_finalizacion' in st.session_state:
                 del st.session_state.procesando_finalizacion
             st.rerun()
             return
 
         # 1. Actualizar tabla produccion
-        st.write("🔍 DEBUG: Actualizando tabla produccion...")
         query_produccion = """
             UPDATE produccion
             SET hora_fin = %s,
@@ -585,13 +624,10 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
                 id_registro
             )
         )
-        st.write(f"🔍 DEBUG: Filas afectadas en produccion: {cursor.rowcount}")
 
         # 2. Guardar detalles editados
         if datos_editados:
-            st.write(f"🔍 DEBUG: Guardando {len(datos_editados)} detalles...")
-            for idx, dato in enumerate(datos_editados):
-                st.write(f"🔍 DEBUG: Detalle {idx + 1}: {dato}")
+            for dato in datos_editados:
                 query_detalle = """
                     INSERT INTO detalles_produccion 
                     (id_registro_produccion, lote_completo, cant_cortada_real, 
@@ -608,11 +644,8 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
                         dato['destino_real']
                     )
                 )
-                st.write(f"🔍 DEBUG: Detalle {idx + 1} insertado OK")
         
-        st.write("🔍 DEBUG: Haciendo COMMIT...")
         conn.commit()
-        st.write("🔍 DEBUG: COMMIT exitoso")
 
         # Limpiar session_state
         if 'procesando_finalizacion' in st.session_state:
@@ -630,14 +663,10 @@ def finalizar_produccion(id_registro, lote_f, ancho_r, obs, datos_editados):
                 del st.session_state[key]
 
         st.success("✅ Producción finalizada y guardada correctamente.")
-        st.write("🔍 DEBUG: Recargando página...")
         st.rerun()
 
     except Exception as e:
-        st.error(f"❌ Error al finalizar producción: {str(e)}")
-        st.write(f"🔍 DEBUG: Tipo de error: {type(e).__name__}")
-        import traceback
-        st.code(traceback.format_exc())
+        st.error(f"❌ Error al finalizar producción: {e}")
         conn.rollback()
         
         if 'procesando_finalizacion' in st.session_state:
