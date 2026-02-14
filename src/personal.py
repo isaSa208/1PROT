@@ -6,9 +6,9 @@ from src.database import get_connection
 def mostrar_pantalla():
     st.title("🛠️ Registro de Producción")
 
-    # ========================================
+    # 
     # PASO 1: INGRESAR LOTE
-    # ========================================
+    # 
     st.subheader("📦 1. Ingrese Lote")
 
     lote_padre = st.text_input(
@@ -55,14 +55,34 @@ def mostrar_pantalla():
             conn.close()
             return
 
-    # OBTENER MÁQUINAS Y MÁQUINA SUGERIDA (PROGRAMADA)
+    # OBTENER MÁQUINAS Y DATOS DE LA ORDEN (INCLUYENDO ESPESOR, CALIDAD, ANCHO_PL)
     cursor.execute("SELECT DISTINCT nombre_maquina FROM ordenes WHERE nombre_maquina IS NOT NULL ORDER BY nombre_maquina")
     lista_maquinas = ["Seleccione Máquina..."] + [row['nombre_maquina'] for row in cursor.fetchall()]
     
-    cursor.execute("SELECT nombre_maquina FROM ordenes WHERE lote_padre = %s LIMIT 1", (lote_padre,))
-    maq_prog = cursor.fetchone()
-    maquina_programada = maq_prog['nombre_maquina'] if maq_prog else "No asignada"
+    # NUEVA CONSULTA: Obtener también espesor, calidad y ancho_pl
+    cursor.execute("""
+        SELECT nombre_maquina, espesor, calidad, ancho_pl 
+        FROM ordenes 
+        WHERE lote_padre = %s 
+        LIMIT 1
+    """, (lote_padre,))
+    datos_prog = cursor.fetchone()
+    
+    if datos_prog:
+        maquina_programada = datos_prog['nombre_maquina'] or "No asignada"
+        espesor_prog = datos_prog.get('espesor', 0)
+        calidad_prog = datos_prog.get('calidad', 'N/A')
+        ancho_pl_prog = datos_prog.get('ancho_pl', 0)
+    else:
+        maquina_programada = "No asignada"
+        espesor_prog = 0
+        calidad_prog = 'N/A'
+        ancho_pl_prog = 0
 
+    # Guardar ancho_pl en session_state para validaciones posteriores
+    st.session_state['ancho_pl_lote'] = ancho_pl_prog
+
+    
     # RESUMEN DE SALDOS (MÉTRICAS) - Cuenta planchas una vez por sesión
     query_saldo = """
         SELECT 
@@ -94,7 +114,7 @@ def mostrar_pantalla():
     meta = int(resumen["meta"] or 0)
     finalizado = int(resumen["finalizado"] or 0)
     en_proceso = int(resumen["en_proceso"] or 0)
-    faltante = meta - (finalizado + en_proceso)  # CORRECCIÓN 3: Calcular faltante correctamente
+    faltante = meta - (finalizado + en_proceso)
     
     # CORRECCIÓN 4: Evitar progreso > 1.0
     progreso_calculado = finalizado / meta if meta > 0 else 0
@@ -105,7 +125,7 @@ def mostrar_pantalla():
     c1, c2, c3 = st.columns(3)
     c1.metric("✅ Finalizadas", f"{finalizado} / {meta}")
     c2.metric("⏳ En Proceso", en_proceso)
-    c3.metric("📦 Pendientes", max(faltante, 0))  # CORRECCIÓN 5: No negativos
+    c3.metric("📦 Pendientes", max(faltante, 0))
     st.progress(progreso_seguro)
 
     # CORRECCIÓN 6: Bloquear si ya está completo
@@ -119,7 +139,7 @@ def mostrar_pantalla():
     # ========================================
     st.subheader("⚙️ 2. Registrar Producción")
     
-    # CORRECCIÓN 7: Verificar sesión del LOTE ACTUAL (cualquier sublote del lote_padre)
+    # CORRECCIÓN 7: Verificar sesión del LOTE ACTUAL
     cursor.execute("""
         SELECT p.* 
         FROM produccion p
@@ -144,8 +164,12 @@ def mostrar_pantalla():
             ancho_real = col_f2.number_input("Ancho Real Plancha (mm):", min_value=0, key="ancho_real")
             observaciones = col_f2.selectbox("Observación:", ["", "Descuadre", "Ondulado", "Quebrado", "Oxidado", "Rayado", "Rebaba", "Bajo espesor", "Daño de maquina"], key="observaciones")
         else:
-            # Antes de iniciar: Elige máquina y planchas
-            col_f1.warning(f"📌 **Maq. Programada:** {maquina_programada}") 
+            # MOSTRAR DATOS PROGRAMADOS (NUEVA VISUALIZACIÓN)
+            col_f1.warning(f"📌 **Maq. Programada:** {maquina_programada}")
+            col_f1.info(f" **Espesor:** {espesor_prog} mm ")
+            col_f1.info(f" **Calidad:** {calidad_prog} ")
+            col_f2.info(f" **Ancho Plancha (ancho_pl):** {ancho_pl_prog} mm")
+            
             maquina_real = col_f1.selectbox("Maq. Real (Elegir):", lista_maquinas, key="maquina_real")
             # CORRECCIÓN 8: max_value basado en faltante
             planchas_proc = col_f1.number_input(
@@ -203,6 +227,7 @@ def mostrar_tabla_lectura(ordenes):
 
 def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
     cursor = st.session_state.get('cursor_temp')
+    ancho_pl = st.session_state.get('ancho_pl_lote', 0)
     
     if 'ordenes_editables' not in st.session_state:
         st.session_state.ordenes_editables = []
@@ -216,15 +241,28 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
                 'espesor': float(o['espesor'] or 0),
                 'cod_SAP': o['cod_SAP'] or '',
                 'cod_IBS': o['cod_IBS'] or '',
-                'descrip_SAP': o['descrip_SAP'] or '',  
+                'descrip_SAP': o['descrip_SAP'] or '',
                 'peso_unitario': float(o['peso_unitario'] or 0),
                 'planchas_procesadas': planchas_proc,
                 'cant': int(o['cant'] or 0),
                 'can_total': int(o['can_total'] or 0),
                 'orden': int(o['orden'] or 0),
-                'desarrollo': int(o['desarrollo'] or 0),  # CORRECCIÓN 10: Agregar desarrollo
+                'desarrollo': int(o['desarrollo'] or 0),
                 'es_nueva': False
             })
+
+    # CALCULAR SUMA TOTAL DE ANCHOS FLEJE
+    suma_anchos_actual = sum(o['ancho_fleje'] for o in st.session_state.ordenes_editables)
+    
+    # MOSTRAR RESUMEN DE VALIDACIÓN
+    col_val1, col_val2 = st.columns(2)
+    col_val1.metric(" Ancho Plancha Disponible", f"{ancho_pl} mm")
+    
+    if suma_anchos_actual > ancho_pl:
+        col_val2.error(f"⚠️ Suma Anchos: {suma_anchos_actual} mm (EXCEDE)")
+    else:
+        espacio_restante = ancho_pl - suma_anchos_actual
+        col_val2.success(f"✅ Suma Anchos: {suma_anchos_actual} mm (Restante: {espacio_restante} mm)")
 
     filas_a_eliminar = []
     for idx, orden in enumerate(st.session_state.ordenes_editables):
@@ -234,32 +272,50 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
             with col1:
                 cant = st.number_input("Cant. Cortada:", min_value=0, value=orden['cant_cortada'], key=f"c_{idx}")
                 st.session_state.ordenes_editables[idx]['cant_cortada'] = cant
+                
+                # CALCULAR PESO TOTAL SIEMPRE (cant_cortada * peso_unitario)
+                peso_total = cant * st.session_state.ordenes_editables[idx]['peso_unitario']
+                st.session_state.ordenes_editables[idx]['peso_total'] = peso_total
             
             with col2:
-                ancho_n = st.number_input("Ancho Fleje (mm):", min_value=0, value=orden['ancho_fleje'], key=f"a_{idx}")
+                # CALCULAR MÁXIMO PERMITIDO PARA ESTE ANCHO
+                suma_otros_anchos = sum(o['ancho_fleje'] for i, o in enumerate(st.session_state.ordenes_editables) if i != idx)
+                max_ancho_permitido = ancho_pl - suma_otros_anchos
                 
-                # CORRECCIÓN 11: Solo buscar si es NUEVA o cambió el ancho
+                ancho_n = st.number_input(
+                    "Ancho Fleje (mm):", 
+                    min_value=0, 
+                    max_value=max(max_ancho_permitido, 0),
+                    value=min(orden['ancho_fleje'], max_ancho_permitido) if max_ancho_permitido > 0 else 0,
+                    key=f"a_{idx}",
+                    help=f"Máximo permitido: {max_ancho_permitido} mm"
+                )
+                
+                # Validar y actualizar
                 if ancho_n != orden['ancho_fleje']:
                     st.session_state.ordenes_editables[idx]['ancho_fleje'] = ancho_n
                     st.session_state.ordenes_editables[idx]['desarrollo'] = ancho_n
                     
+                    # Buscar SOLO datos técnicos (peso, largo, espesor) - NO orden ni descrip_SAP
                     if ancho_n > 0 and cursor:
                         cursor.execute("""
-                            SELECT peso_unitario, largo, espesor, descrip_SAP
+                            SELECT peso_unitario, largo, espesor
                             FROM ordenes 
                             WHERE desarrollo = %s 
                             LIMIT 1
                         """, (ancho_n,))
                         ref = cursor.fetchone()
                         if ref:
-                            # CORRECCIÓN 12: NO cambiar cod_SAP ni cod_IBS
+                            # SOLO actualizar datos técnicos
+                            # NO tocar cod_SAP, cod_IBS, orden, ni descrip_SAP
                             st.session_state.ordenes_editables[idx].update({
                                 'peso_unitario': float(ref['peso_unitario'] or 0),
                                 'largo': int(ref['largo'] or 0),
-                                'espesor': float(ref['espesor'] or 0),
-                                'descrip_SAP': ref['descrip_SAP'] or ''
+                                'espesor': float(ref['espesor'] or 0)
                             })
                             st.success(f"✅ Peso: {float(ref['peso_unitario'] or 0):.4f} kg")
+                        else:
+                            st.warning(f"⚠️ No se encontró referencia para desarrollo {ancho_n}mm")
             
             with col3:
                 dest = st.selectbox("Destino:", ["PLEGADO", "VENTA"], index=0 if orden['destino'] == 'PLEGADO' else 1, key=f"d_{idx}")
@@ -268,20 +324,28 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
             if orden['es_nueva'] and col4.button("🗑️", key=f"del_{idx}"):
                 filas_a_eliminar.append(idx)
 
-            # Calcular peso total
-            peso_t = orden['peso_unitario'] * orden['cant_cortada']
-            st.session_state.ordenes_editables[idx]['peso_total'] = peso_t
-            
             st.markdown(f"📝 **Descripción:** {orden.get('descrip_SAP', 'N/A')}")
-            st.caption(f"Largo: {orden['largo']}mm | SAP: {orden['cod_SAP']} | IBS: {orden['cod_IBS']} | Orden: {orden['orden']}")
+            
+            # Mostrar códigos solo si existen (filas originales)
+            if orden.get('cod_SAP') or orden.get('cod_IBS'):
+                st.caption(f"Largo: {orden['largo']}mm | SAP: {orden['cod_SAP']} | IBS: {orden['cod_IBS']} | Orden: {orden['orden']}")
+            else:
+                st.caption(f"Largo: {orden['largo']}mm | Sin códigos SAP/IBS | Orden: {orden['orden']}")
 
     for idx in sorted(filas_a_eliminar, reverse=True):
         st.session_state.ordenes_editables.pop(idx)
         st.rerun()
     
-    if st.button("➕ Agregar Nueva Orden", use_container_width=True):
+    # VALIDAR ANTES DE PERMITIR AGREGAR
+    suma_total = sum(o['ancho_fleje'] for o in st.session_state.ordenes_editables)
+    puede_agregar = suma_total < ancho_pl
+    
+    if st.button("➕ Agregar Nueva Orden", use_container_width=True, disabled=not puede_agregar):
         agregar_nueva_orden(lote_padre, planchas_proc)
         st.rerun()
+    
+    if not puede_agregar:
+        st.warning("⚠️ No se pueden agregar más órdenes: la suma de anchos alcanzó el límite del ancho de plancha.")
     
     mostrar_tabla_resumen()
 
@@ -289,6 +353,8 @@ def agregar_nueva_orden(lote_padre, planchas_proc):
     ordenes = st.session_state.ordenes_editables
     nums = [int(o['lote_completo'].split('-')[-1]) for o in ordenes if '-' in o['lote_completo']]
     sig = max(nums) + 1 if nums else 1
+    
+    # NUEVA FILA SIN cod_SAP ni cod_IBS
     st.session_state.ordenes_editables.append({
         'lote_completo': f"{lote_padre}-{sig:02d}", 
         'cant_cortada': 0, 
@@ -296,15 +362,15 @@ def agregar_nueva_orden(lote_padre, planchas_proc):
         'destino': 'VENTA', 
         'largo': 0, 
         'espesor': 0, 
-        'cod_SAP': '', 
-        'cod_IBS': '',
+        'cod_SAP': '',  # Vacío para nuevas
+        'cod_IBS': '',  # Vacío para nuevas
         'descrip_SAP': '', 
         'peso_unitario': 0, 
         'planchas_procesadas': planchas_proc,
         'cant': 0, 
         'can_total': 0, 
         'orden': 0,
-        'desarrollo': 0,  # CORRECCIÓN 13: Agregar desarrollo
+        'desarrollo': 0,
         'es_nueva': True
     })
 
@@ -313,7 +379,7 @@ def mostrar_tabla_resumen():
     if st.session_state.ordenes_editables:
         datos = []
         for o in st.session_state.ordenes_editables:
-            datos.append({
+            fila = {
                 'Lote': o['lote_completo'], 
                 'Cant Cortada': o['cant_cortada'],
                 'Ancho Fleje': o['ancho_fleje'], 
@@ -321,10 +387,16 @@ def mostrar_tabla_resumen():
                 'Destino': o['destino'],
                 'Peso Unit.': f"{o['peso_unitario']:.4f}", 
                 'Peso Total': f"{o.get('peso_total', 0):.4f}",
-                'Largo': o['largo'], 
-                'SAP': o['cod_SAP'], 
-                'Orden': o['orden']
-            })
+                'Largo': o['largo']
+            }
+            
+            # Solo mostrar SAP/Orden si existen
+            if o.get('cod_SAP'):
+                fila['SAP'] = o['cod_SAP']
+            if o.get('orden'):
+                fila['Orden'] = o['orden']
+                
+            datos.append(fila)
         st.dataframe(pd.DataFrame(datos), use_container_width=True, hide_index=True)
 
 def iniciar_produccion(lote_p, planchas, maq_real, maq_programada):
@@ -355,13 +427,13 @@ def iniciar_produccion(lote_p, planchas, maq_real, maq_programada):
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'procesando', %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(query, (
-                o['lote_completo'],  # 4019783-01, 4019783-02, etc.
+                o['lote_completo'],
                 id_usuario, 
                 planchas, 
                 maq_real,
                 maq_programada,
                 nombre_op, 
-                hora_inicio_comun,  # Misma hora para todos
+                hora_inicio_comun,
                 o['orden'], 
                 o['can_total'], 
                 o['desarrollo'], 
@@ -393,7 +465,7 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
     try:
         cursor = conn.cursor(dictionary=True)
         
-        # 1. Obtener información base para la tanda (lote padre y tiempo)
+        # 1. Obtener información base para la tanda
         cursor.execute("""
             SELECT o.lote_padre, p.hora_inicio, p.id_personal, p.planchas_procesadas,
                    p.maquina_real, p.maq_proces, p.operador
@@ -458,7 +530,7 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
                 VALUES (%s, %s, %s, %s, %s)
             """, (reg['id_registro'], lote_c, edit.get('cant_cortada', 0), edit.get('ancho_fleje', 0), edit.get('destino', 'VENTA')))
 
-        # 3. INSERTAR órdenes nuevas (Filas agregadas manualmente)
+        # 3. INSERTAR órdenes nuevas (sin cod_SAP ni cod_IBS)
         if ordenes_nuevas:
             for nueva in ordenes_nuevas:
                 query_insert = """
@@ -490,6 +562,8 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
         # 4. Limpieza y éxito
         if 'ordenes_editables' in st.session_state:
             del st.session_state['ordenes_editables']
+        if 'ancho_pl_lote' in st.session_state:
+            del st.session_state['ancho_pl_lote']
         for key in ["input_lote", "lote_fisico", "ancho_real", "observaciones"]:
             if key in st.session_state: del st.session_state[key]
             
