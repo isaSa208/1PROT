@@ -57,7 +57,7 @@ def mostrar_pantalla():
     lista_maquinas = ["Seleccione Máquina..."] + [row['nombre_maquina'] for row in cursor.fetchall()]
     
     cursor.execute("""
-        SELECT nombre_maquina, espesor, calidad, ancho_pl 
+        SELECT nombre_maquina, espesor, calidad, ancho_pl, desaplancha
         FROM ordenes 
         WHERE lote_padre = %s 
         LIMIT 1
@@ -65,17 +65,20 @@ def mostrar_pantalla():
     datos_prog = cursor.fetchone()
     
     if datos_prog:
-        maquina_programada = datos_prog['nombre_maquina'] or "No asignada"
-        espesor_prog = datos_prog.get('espesor', 0)
-        calidad_prog = datos_prog.get('calidad', 'N/A')
-        ancho_pl_prog = datos_prog.get('ancho_pl', 0)
+        maquina_programada  = datos_prog['nombre_maquina'] or "No asignada"
+        espesor_prog        = datos_prog.get('espesor', 0)
+        calidad_prog        = datos_prog.get('calidad', 'N/A')
+        ancho_pl_prog       = datos_prog.get('ancho_pl', 0)
+        desaplancha_prog    = datos_prog.get('desaplancha', 0)
     else:
-        maquina_programada = "No asignada"
-        espesor_prog = 0
-        calidad_prog = 'N/A'
-        ancho_pl_prog = 0
+        maquina_programada  = "No asignada"
+        espesor_prog        = 0
+        calidad_prog        = 'N/A'
+        ancho_pl_prog       = 0
+        desaplancha_prog    = 0
 
-    st.session_state['ancho_pl_lote'] = ancho_pl_prog
+    # desaplancha es el aprovechamiento real — se usa como límite en la validación de áreas
+    st.session_state['ancho_pl_lote'] = desaplancha_prog
 
     query_saldo = """
         SELECT 
@@ -153,6 +156,7 @@ def mostrar_pantalla():
             col_f1.info(f" **Espesor:** {espesor_prog} mm ")
             col_f1.info(f" **Calidad:** {calidad_prog} ")
             col_f2.info(f" **Ancho Plancha (ancho_pl):** {ancho_pl_prog} mm")
+            col_f2.info(f" **Desaplancha (aprovechamiento):** {desaplancha_prog} mm")
             
             maquina_real = col_f1.selectbox("Maq. Real (Elegir):", lista_maquinas, key="maquina_real")
             planchas_proc = col_f1.number_input(
@@ -206,7 +210,7 @@ def mostrar_tabla_lectura(ordenes):
 def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
     cursor = st.session_state.get('cursor_temp')
     ancho_pl = st.session_state.get('ancho_pl_lote', 0)
-    
+
     if 'ordenes_editables' not in st.session_state:
         st.session_state.ordenes_editables = []
         for o in ordenes_originales:
@@ -229,46 +233,74 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
                 'es_nueva': False
             })
 
-    suma_anchos_actual = sum(o['ancho_fleje'] for o in st.session_state.ordenes_editables)
-    
+    # ─────────────────────────────────────────────────────────────────────────
+    # VALIDACIÓN DE ÁREA CORREGIDA
+    # Límite  = ancho_pl × planchas_procesadas
+    # Suma    = Σ (cant_cortada × ancho_fleje) por cada orden
+    # ─────────────────────────────────────────────────────────────────────────
+    limite_area = ancho_pl * planchas_proc
+    suma_areas_actual = sum(
+        o['cant_cortada'] * o['ancho_fleje']
+        for o in st.session_state.ordenes_editables
+    )
+
     col_val1, col_val2 = st.columns(2)
-    col_val1.metric(" Ancho Plancha Disponible", f"{ancho_pl} mm")
-    
-    if suma_anchos_actual > ancho_pl:
-        col_val2.error(f"⚠️ Suma Anchos: {suma_anchos_actual} mm (EXCEDE)")
+    col_val1.metric("Área Máxima (desaplancha × planchas)", f"{limite_area:,} mm²")
+
+    restante = limite_area - suma_areas_actual
+
+    if suma_areas_actual > limite_area:
+        exceso = suma_areas_actual - limite_area
+        col_val2.error(f"⚠️ Suma Áreas: {suma_areas_actual:,} mm² (EXCEDE en {exceso:,} mm²)")
+    elif restante == 0:
+        col_val2.success(f"✅ Suma Áreas: {suma_areas_actual:,} mm² (Completo ✔)")
     else:
-        espacio_restante = ancho_pl - suma_anchos_actual
-        col_val2.success(f"✅ Suma Anchos: {suma_anchos_actual} mm (Restante: {espacio_restante} mm)")
+        col_val2.success(f"✅ Suma Áreas: {suma_areas_actual:,} mm² (Restante: {restante:,} mm²)")
 
     filas_a_eliminar = []
     for idx, orden in enumerate(st.session_state.ordenes_editables):
         with st.expander(f"📦 {orden['lote_completo']} {'[NUEVA]' if orden['es_nueva'] else ''}", expanded=True):
             col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
-            
+
             with col1:
                 cant = st.number_input("Cant. Cortada:", min_value=0, value=orden['cant_cortada'], key=f"c_{idx}")
                 st.session_state.ordenes_editables[idx]['cant_cortada'] = cant
-                
+
                 peso_total = cant * st.session_state.ordenes_editables[idx]['peso_unitario']
                 st.session_state.ordenes_editables[idx]['peso_total'] = peso_total
-            
+
             with col2:
-                suma_otros_anchos = sum(o['ancho_fleje'] for i, o in enumerate(st.session_state.ordenes_editables) if i != idx)
-                max_ancho_permitido = ancho_pl - suma_otros_anchos
-                
+                # ─────────────────────────────────────────────────────────────
+                # CÁLCULO DE ANCHO MÁXIMO PERMITIDO PARA ESTA ORDEN
+                # Área disponible = límite - suma de áreas de las otras órdenes
+                # Ancho máximo    = área disponible / cant_cortada de esta orden
+                # ─────────────────────────────────────────────────────────────
+                suma_otras_areas = sum(
+                    o['cant_cortada'] * o['ancho_fleje']
+                    for i, o in enumerate(st.session_state.ordenes_editables)
+                    if i != idx
+                )
+                area_disponible = max(limite_area - suma_otras_areas, 0)
+                cant_esta_orden = st.session_state.ordenes_editables[idx]['cant_cortada']
+
+                if cant_esta_orden > 0:
+                    max_ancho_permitido = int(area_disponible // cant_esta_orden)
+                else:
+                    max_ancho_permitido = 0
+
                 ancho_n = st.number_input(
-                    "Ancho Fleje (mm):", 
-                    min_value=0, 
-                    max_value=max(max_ancho_permitido, 0),
+                    "Ancho Fleje (mm):",
+                    min_value=0,
+                    max_value=max_ancho_permitido,
                     value=min(orden['ancho_fleje'], max_ancho_permitido) if max_ancho_permitido > 0 else 0,
                     key=f"a_{idx}",
-                    help=f"Máximo permitido: {max_ancho_permitido} mm"
+                    help=f"Máximo permitido: {max_ancho_permitido} mm (área disp.: {area_disponible:,} mm²)"
                 )
-                
+
                 if ancho_n != orden['ancho_fleje']:
                     st.session_state.ordenes_editables[idx]['ancho_fleje'] = ancho_n
                     st.session_state.ordenes_editables[idx]['desarrollo'] = ancho_n
-                    
+
                     if ancho_n > 0 and cursor:
                         cursor.execute("""
                             SELECT peso_unitario, largo, espesor
@@ -286,16 +318,16 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
                             st.success(f"✅ Peso: {float(ref['peso_unitario'] or 0):.4f} kg")
                         else:
                             st.warning(f"⚠️ No se encontró referencia para desarrollo {ancho_n}mm")
-            
+
             with col3:
                 dest = st.selectbox("Destino:", ["PLEGADO", "VENTA"], index=0 if orden['destino'] == 'PLEGADO' else 1, key=f"d_{idx}")
                 st.session_state.ordenes_editables[idx]['destino'] = dest
-            
+
             if orden['es_nueva'] and col4.button("🗑️", key=f"del_{idx}"):
                 filas_a_eliminar.append(idx)
 
             st.markdown(f"📝 **Descripción:** {orden.get('descrip_SAP', 'N/A')}")
-            
+
             if orden.get('cod_SAP') or orden.get('cod_IBS'):
                 st.caption(f"Largo: {orden['largo']}mm | SAP: {orden['cod_SAP']} | IBS: {orden['cod_IBS']} | Orden: {orden['orden']}")
             else:
@@ -304,17 +336,19 @@ def mostrar_tabla_edicion(ordenes_originales, planchas_proc, lote_padre):
     for idx in sorted(filas_a_eliminar, reverse=True):
         st.session_state.ordenes_editables.pop(idx)
         st.rerun()
-    
-    suma_total = sum(o['ancho_fleje'] for o in st.session_state.ordenes_editables)
-    puede_agregar = suma_total < ancho_pl
-    
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # BOTÓN AGREGAR: usa suma de áreas vs límite de área
+    # ─────────────────────────────────────────────────────────────────────────
+    puede_agregar = restante > 0
+
     if st.button("➕ Agregar Nueva Orden", use_container_width=True, disabled=not puede_agregar):
         agregar_nueva_orden(lote_padre, planchas_proc)
         st.rerun()
-    
+
     if not puede_agregar:
-        st.warning("⚠️ No se pueden agregar más órdenes: la suma de anchos alcanzó el límite del ancho de plancha.")
-    
+        st.warning("⚠️ No se pueden agregar más órdenes: el área total utilizada alcanzó el límite permitido.")
+
     mostrar_tabla_resumen()
 
 
@@ -351,7 +385,8 @@ def mostrar_tabla_resumen():
             fila = {
                 'Lote': o['lote_completo'], 
                 'Cant Cortada': o['cant_cortada'],
-                'Ancho Fleje': o['ancho_fleje'], 
+                'Ancho Fleje': o['ancho_fleje'],
+                'Área (cant×ancho)': o['cant_cortada'] * o['ancho_fleje'],
                 'Flejes Pend.': o.get('can_total', 0),
                 'Destino': o['destino'],
                 'Peso Unit.': f"{o['peso_unitario']:.4f}", 
@@ -471,7 +506,6 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
         diferencia      = h_fin - h_inicio
         total_segundos  = int(diferencia.total_seconds())
 
-        # Formato HH:MM:SS del tiempo total real (para registros de ordenes sin ponderar)
         def segundos_a_hhmmss(seg):
             h, r = divmod(int(seg), 3600)
             m, s = divmod(r, 60)
@@ -504,20 +538,19 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
         # ── 6. Área de plancha y merma base ───────────────────────────────────────
         planchas_proc  = int(info['planchas_procesadas'])
         area_plancha   = float(ancho_r) * float(planchas_proc)
-        diff           = area_plancha - suma_areas                              # puede ser negativo
-        merma_base_kg  = (diff * espesor_lote * largo_lote * 7.85) / 1_000_000 # constantes fijas
+        diff           = area_plancha - suma_areas
+        merma_base_kg  = (diff * espesor_lote * largo_lote * 7.85) / 1_000_000
 
         # ── 7. Función auxiliar: merma y tiempo ponderado para una orden ──────────
         def calcular_merma_y_tiempo(cant_cortada, ancho_fleje):
-            """Retorna (merma_kg, tiempo_ponderado_str) para una orden."""
             area_orden = float(cant_cortada) * float(ancho_fleje)
             if suma_areas > 0:
                 porcentaje = (area_orden * 100.0) / suma_areas
             else:
                 porcentaje = 0.0
-            merma_orden         = (porcentaje * merma_base_kg) / 100.0
-            seg_ponderados      = total_segundos * (porcentaje / 100.0)
-            tiempo_pond_str     = segundos_a_hhmmss(seg_ponderados)
+            merma_orden     = (porcentaje * merma_base_kg) / 100.0
+            seg_ponderados  = total_segundos * (porcentaje / 100.0)
+            tiempo_pond_str = segundos_a_hhmmss(seg_ponderados)
             return merma_orden, tiempo_pond_str
 
         # ── 8. Registros activos en BD para este lote padre ───────────────────────
@@ -559,17 +592,16 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
                 lote_f,
                 ancho_r,
                 obs,
-                tiempo_total_str,          # tiempo real total HH:MM:SS
+                tiempo_total_str,
                 edit.get('peso_total', 0),
                 cant_c,
                 ancho_f,
                 edit.get('destino', 'VENTA'),
-                round(merma_ord, 4),        # merma en kg (puede ser negativo)
-                tiempo_pond_str,            # tiempo ponderado HH:MM:SS
+                round(merma_ord, 4),
+                tiempo_pond_str,
                 reg['id_registro']
             ))
 
-            # Histórico en detalles_produccion
             cursor.execute("""
                 INSERT INTO detalles_produccion 
                 (id_registro_produccion, lote_completo, cant_cortada_real, ancho_fleje_real, destino_real) 
@@ -623,7 +655,6 @@ def finalizar_produccion(id_reg, lote_f, ancho_r, obs):
                     tiempo_pond_str
                 ))
 
-                # Detalle para la nueva orden
                 cursor.execute("""
                     INSERT INTO detalles_produccion 
                     (id_registro_produccion, lote_completo, cant_cortada_real, ancho_fleje_real, destino_real) 
